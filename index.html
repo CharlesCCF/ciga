@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smoke Effect with Hand Gesture Recognition</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+        }
+        #message {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            font-size: 24px;
+            color: black;
+        }
+        .input_video {
+            z-index: 1;
+            display: none;
+            width: 100%;
+            height: 100%;
+        }
+        #overlay {
+            z-index: 3;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            pointer-events: none;
+            /* background: radial-gradient(circle, rgba(0, 0, 0, 0) 0%, rgba(0, 0, 0, 1) 100%); */
+        }
+        .symbol {
+            z-index: 4;
+            position: absolute;
+            font-size: 30px;
+            font-family: Georgia, 'Times New Roman', Times, serif;
+            color: rgba(255, 255, 255, 0.439);
+            pointer-events: none;
+            opacity: 1;
+            transition: opacity 2s ease-out; /* Smooth fading out */
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+</head>
+<body>
+    <video class="input_video" autoplay></video>
+    <div id="message"></div>
+    <div id="overlay"></div> <!-- Full-screen overlay -->
+    <div id="symbols"></div> <!-- Container for symbols -->
+
+    <script>
+        var camera, scene, renderer,
+            geometry, material, mesh,
+            stats, clock, smokeParticles,
+            light, smokeTexture, smokeMaterial, smokeGeo,
+            videoTexture, videoMaterial, videoPlane;
+    
+        var mouseX = 0, mouseY = 0;
+        var isGestureDetected = false;
+        var darkeningFactor = 0; // 0 means no darkening, 1 means fully black
+        var baseSymbolFrequency = 0.1; // Base frequency of symbol spawning
+        var baseSymbolSize = 30; // Base size of symbols
+        var symbols = [];
+    
+        init();
+        animate();
+    
+        function init() {
+    stats = new Stats();
+    stats.showPanel(0); // 0: fps, 1: ms, 2: mb, 3+: custom
+    stats.domElement.style.position = 'absolute';
+    stats.domElement.style.left = '0px';
+    stats.domElement.style.top = '0px';
+    document.body.appendChild(stats.domElement);
+
+    clock = new THREE.Clock();
+
+    renderer = new THREE.WebGLRenderer({ alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x000000, 0); // Ensure the canvas is transparent
+    renderer.domElement.style.position = 'absolute'; // Ensure it's positioned correctly
+    renderer.domElement.style.top = '0'; // Align with the top
+    renderer.domElement.style.left = '0'; // Align with the left
+
+    scene = new THREE.Scene();
+
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 10000);
+    camera.position.z = 1000;
+    scene.add(camera);
+
+    light = new THREE.DirectionalLight(0xffffff, 0.5);
+    light.position.set(-1, 0, 1);
+    scene.add(light);
+
+    // Initialize video texture
+    const videoElement = document.getElementsByClassName('input_video')[0];
+    videoElement.style.position = 'absolute';
+    videoElement.style.top = '0';
+    videoElement.style.left = '0';
+    videoElement.style.width = '100vw'; // Fullscreen width
+    videoElement.style.height = '100vh'; // Fullscreen height
+
+    videoTexture = new THREE.VideoTexture(videoElement);
+    videoTexture.minFilter = THREE.LinearFilter;
+    videoTexture.magFilter = THREE.LinearFilter;
+    videoTexture.format = THREE.RGBFormat;
+
+    videoMaterial = new THREE.MeshBasicMaterial({ map: videoTexture });
+    const videoGeo = new THREE.PlaneGeometry(window.innerWidth, window.innerHeight);
+    videoPlane = new THREE.Mesh(videoGeo, videoMaterial);
+    
+    // Mirror the video by scaling the plane
+    videoPlane.scale.x = -1; // Flip horizontally
+    scene.add(videoPlane);
+
+    smokeTexture = new THREE.TextureLoader().load('https://s3-us-west-2.amazonaws.com/s.cdpn.io/95637/Smoke-Element.png');
+    smokeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff, map: smokeTexture, transparent: true });
+    smokeGeo = new THREE.PlaneGeometry(300, 300);
+    smokeParticles = [];
+
+    document.body.appendChild(renderer.domElement);
+
+    const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    const mpCamera = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({ image: videoElement });
+        },
+        width: 720,
+        height: 400
+    });
+    mpCamera.start();
+
+    function isFingerExtended(landmarks) {
+        const [base, middle, top, tip] = landmarks;
+        return (tip.y < top.y) && (top.y < middle.y) && (middle.y < base.y);
+    }
+
+    function isCigaretteHoldingGesture(landmarks) {
+        const INDEX_FINGER = [5, 6, 7, 8];
+        const MIDDLE_FINGER = [9, 10, 11, 12];
+        const RING_FINGER = [13, 14, 15, 16];
+        const PINKY_FINGER = [17, 18, 19, 20];
+
+        const indexFingerLandmarks = INDEX_FINGER.map(i => landmarks[i]);
+        const middleFingerLandmarks = MIDDLE_FINGER.map(i => landmarks[i]);
+        const ringFingerLandmarks = RING_FINGER.map(i => landmarks[i]);
+        const pinkyFingerLandmarks = PINKY_FINGER.map(i => landmarks[i]);
+
+        const indexExtended = isFingerExtended(indexFingerLandmarks);
+        const middleExtended = isFingerExtended(middleFingerLandmarks);
+        const ringNotExtended = !isFingerExtended(ringFingerLandmarks);
+        const pinkyNotExtended = !isFingerExtended(pinkyFingerLandmarks);
+
+        return indexExtended && middleExtended && ringNotExtended && pinkyNotExtended;
+    }
+
+    hands.onResults((results) => {
+        if (results.multiHandLandmarks.length > 0) {
+            const currentLandmarks = results.multiHandLandmarks[0];
+            const indexFingerTip = currentLandmarks[8]; // Index finger tip landmark
+
+            if (isCigaretteHoldingGesture(currentLandmarks)) {
+                // document.getElementById('message').textContent = "Cigarette holding gesture detected!";
+                // document.getElementById('message').style.color = "green";
+                isGestureDetected = true;
+                mouseX = indexFingerTip.x * window.innerWidth;
+                mouseY = indexFingerTip.y * window.innerHeight;
+            } else {
+                // document.getElementById('message').textContent = "Gesture not detected.";
+                // document.getElementById('message').style.color = "red";
+                isGestureDetected = false;
+            }
+        } else {
+            // document.getElementById('message').textContent = "No hand detected.";
+            // document.getElementById('message').style.color = "black";
+            isGestureDetected = false;
+        }
+    });
+}
+
+    
+        function animate() {
+            stats.begin();
+            delta = clock.getDelta();
+            requestAnimationFrame(animate);
+            if (isGestureDetected) {
+                createSmokeAtCursor();
+                spawnSymbols();
+                darkeningFactor = Math.min(darkeningFactor + delta * 0.1, 1); // Gradually increase darkening
+            } else {
+                darkeningFactor = Math.max(darkeningFactor - delta * 0.3, 0); // Gradually decrease darkening
+            }
+            evolveSmoke();
+            render();
+            stats.end();
+        }
+    
+        function createSmokeAtCursor() {
+    // Create smoke particle
+    var particle = new THREE.Mesh(smokeGeo, smokeMaterial.clone());
+
+    // Adjust for mirrored video plane
+        particle.position.set(
+            -mouseX + window.innerWidth / 2, // Invert x-coordinate
+            -mouseY + window.innerHeight / 2,
+            0
+        );
+
+        // Set random rotation and initial properties
+        particle.rotation.z = Math.random() * 360;
+        particle.velocity = new THREE.Vector3(
+            (Math.random() - 0.5) * 0.5,
+            Math.random() * 0.5,
+            0
+        );
+        particle.material.opacity = 1; // Initial opacity
+        particle.scale.multiplyScalar(Math.random() * 0.5 + 0.5); // Random size multiplier
+        scene.add(particle);
+        smokeParticles.push(particle);
+        }
+    
+        function spawnSymbols() {
+            // Adjust frequency and size based on darkeningFactor
+            const adjustedSymbolFrequency = baseSymbolFrequency + darkeningFactor * 9.7; // Increase frequency
+            const adjustedSymbolSize = baseSymbolSize + darkeningFactor * 300; // Increase size
+    
+            if (Math.random() < adjustedSymbolFrequency) {
+                const symbolContainer = document.getElementById('symbols');
+                const symbol = document.createElement('div');
+                symbol.className = 'symbol';
+                symbol.textContent = randomSymbol();
+                symbol.style.fontSize = `${adjustedSymbolSize}px`;
+                symbol.style.left = `${Math.random() * window.innerWidth}px`;
+                symbol.style.top = `${Math.random() * window.innerHeight}px`;
+                symbolContainer.appendChild(symbol);
+    
+                // Fade out and remove symbol after a few seconds
+                setTimeout(() => {
+                    symbol.style.opacity = '0';
+                    setTimeout(() => {
+                        symbol.remove();
+                    }, 2000);
+                }, 2000);
+            }
+        }
+    
+        function randomSymbol() {
+            const symbols = ' ○ ◌ ◍ ◎ ● ◉';
+            return symbols.charAt(Math.floor(Math.random() * symbols.length));
+        }
+    
+        function evolveSmoke() {
+            var sp = smokeParticles.length;
+            while (sp--) {
+                smokeParticles[sp].rotation.z += (delta * 0.2);
+                smokeParticles[sp].position.add(smokeParticles[sp].velocity);
+                smokeParticles[sp].velocity.y += delta * 0.01; // Apply upward force
+                smokeParticles[sp].material.opacity -= delta * 0.1; // Decrease opacity over time
+    
+                // Remove smoke particles that are out of view or fully transparent
+                if (smokeParticles[sp].position.y > window.innerHeight / 2 || smokeParticles[sp].material.opacity <= 0) {
+                    scene.remove(smokeParticles[sp]);
+                    smokeParticles.splice(sp, 1);
+                }
+            }
+        }
+    
+        function render() {
+            renderer.render(scene, camera);
+    
+            // Update overlay opacity
+            const overlay = document.getElementById('overlay');
+    const transparentStop = `${100 - darkeningFactor * 1000}%`;
+    overlay.style.background = `radial-gradient(circle, rgba(0, 0, 0, 0) ${transparentStop}, rgba(0, 0, 0, 1) 100%)`;
+}
+
+        function updateVideoPlaneGeometry() {
+    // Create or update video plane geometry
+    const aspect = window.innerWidth / window.innerHeight;
+    const videoGeo = new THREE.PlaneGeometry(window.innerWidth, window.innerHeight);
+    
+    if (videoPlane) {
+        videoPlane.geometry.dispose();
+        videoPlane.geometry = videoGeo;
+    } else {
+        videoPlane = new THREE.Mesh(videoGeo, videoMaterial);
+    }
+
+    // Ensure the video plane covers the screen and is mirrored
+    videoPlane.scale.set(1, -1, 1); // Mirror the video plane vertically
+    videoPlane.position.set(0, 0, 0); // Center the video plane
+        }
+
+        function onWindowResize() {
+            // Update renderer size
+            renderer.setSize(window.innerWidth, window.innerHeight);
+
+            // Update camera aspect ratio
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+
+            // Update video plane geometry
+            updateVideoPlaneGeometry();
+        }
+    </script>
+</body>
+</html>
